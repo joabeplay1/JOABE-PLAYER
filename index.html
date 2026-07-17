@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Germiani IA Studio 2.5 Flexh</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #030712; color: white; font-family: ui-sans-serif, system-ui, sans-serif; }
+    ::-webkit-scrollbar { width: 6px; }
+    ::-webkit-scrollbar-track { background: #111827; }
+    ::-webkit-scrollbar-thumb { background: #374151; border-radius: 3px; }
+  </style>
+  <script type="importmap">
+  {
+    "imports": {
+      "react": "https://esm.sh/react@18.2.0",
+      "react-dom/client": "https://esm.sh/react-dom@18.2.0/client",
+      "react-router-dom": "https://esm.sh/react-router-dom@6.26.0"
+    }
+  }
+  </script>
+</head>
+<body>
+<div id="root"></div>
+<script type="module">
+import React, { useState, useEffect, useRef } from 'react';
+import { createRoot } from 'react-dom/client';
+import { HashRouter as Router, Routes, Route, Link, useLocation, Outlet } from 'react-router-dom';
+
+// ── LocalStorage Store ────────────────────────────────────────────────────────
+const genId = () => Date.now().toString(36) + Math.random().toString(36).slice(2);
+const getCol = (n) => { try { return JSON.parse(localStorage.getItem('germiani_'+n)||'[]'); } catch { return []; } };
+const saveCol = (n, d) => localStorage.setItem('germiani_'+n, JSON.stringify(d));
+const makeStore = (name) => ({
+  list(sf='-created_date',lim=100){ let d=getCol(name); const desc=sf.startsWith('-'); const f=sf.replace(/^-/,''); d.sort((a,b)=>{const va=a[f]??'',vb=b[f]??''; return desc?(va<vb?1:-1):(va>vb?1:-1);}); return d.slice(0,lim); },
+  filter(q){ return getCol(name).filter(i=>Object.entries(q).every(([k,v])=>i[k]===v)); },
+  get(id){ return getCol(name).find(i=>i.id===id)||null; },
+  create(r){ const d=getCol(name); const n={...r,id:genId(),created_date:new Date().toISOString(),updated_date:new Date().toISOString()}; d.push(n); saveCol(name,d); return n; },
+  update(id,c){ const d=getCol(name); const i=d.findIndex(x=>x.id===id); if(i<0) throw new Error('not found'); d[i]={...d[i],...c,updated_date:new Date().toISOString()}; saveCol(name,d); return d[i]; },
+  delete(id){ saveCol(name,getCol(name).filter(i=>i.id!==id)); },
+});
+const db = { projects:makeStore('projects'), executions:makeStore('executions'), settings:makeStore('settings') };
+const getSettings = () => db.settings.list()[0]||null;
+const saveSettings = (data) => { const e=getSettings(); return e?db.settings.update(e.id,data):db.settings.create(data); };
+
+// ── GitHub API ────────────────────────────────────────────────────────────────
+const API = 'https://api.github.com';
+const gh = (t) => ({ Authorization:'token '+t, Accept:'application/vnd.github.v3+json', 'Content-Type':'application/json' });
+const toB64 = (str) => { try { return btoa(unescape(encodeURIComponent(str))); } catch { return btoa(str); } };
+
+const ghApi = {
+  async testConnection(token, username) {
+    const r = await fetch(API+'/user', {headers:gh(token)});
+    if (!r.ok) throw new Error('Token inválido ou expirado');
+    const d = await r.json(); return d;
+  },
+  async ensureRepo(token, owner, repo) {
+    const r = await fetch(API+'/repos/'+owner+'/'+repo, {headers:gh(token)});
+    if (r.ok) return r.json();
+    const c = await fetch(API+'/user/repos', {method:'POST',headers:gh(token),body:JSON.stringify({name:repo,private:false,auto_init:true,description:'Germiani IA Studio'})});
+    if (!c.ok) { const e=await c.json(); throw new Error(e.message||'Não foi possível criar o repositório'); }
+    return c.json();
+  },
+  async listRepos(token) {
+    const r = await fetch(API+'/user/repos?per_page=100&sort=updated', {headers:gh(token)});
+    if (!r.ok) throw new Error('Erro ao listar repositórios');
+    return r.json();
+  },
+  async getFileSha(token, owner, repo, branch, path) {
+    const r = await fetch(API+'/repos/'+owner+'/'+repo+'/contents/'+path+'?ref='+branch, {headers:gh(token)});
+    if (r.ok) { const d=await r.json(); return d.sha; } return null;
+  },
+  async putFile(token, owner, repo, branch, path, content, sha) {
+    const body = {message:'update '+path, content, branch}; if (sha) body.sha = sha;
+    const r = await fetch(API+'/repos/'+owner+'/'+repo+'/contents/'+path, {method:'PUT',headers:gh(token),body:JSON.stringify(body)});
+    if (!r.ok) { const e=await r.json(); throw new Error(e.message||'Erro ao enviar '+path); }
+    return r.json();
+  },
+  async enablePages(token, owner, repo) {
+    try { await fetch(API+'/repos/'+owner+'/'+repo+'/pages', {method:'POST',headers:gh(token),body:JSON.stringify({source:{branch:'main',path:'/'}}) }); } catch {}
+  },
+  async fileToBase64(file) {
+    return new Promise((res,rej)=>{ const rd=new FileReader(); rd.onload=()=>res(rd.result.split(',')[1]); rd.onerror=rej; rd.readAsDataURL(file); });
+  },
+};
+
+// ── Shared styles ─────────────────────────────────────────────────────────────
+const C = {
+  card: {background:'#111827',border:'1px solid #1f2937',borderRadius:12,padding:16},
+  inp: {background:'#1f2937',border:'1px solid #374151',borderRadius:8,color:'white',padding:'8px 12px',width:'100%',fontSize:13,outline:'none'},
+  btn: (bg) => ({padding:'10px 20px',borderRadius:8,border:'none',background:bg||'linear-gradient(135deg,#7c3aed,#a855f7)',color:'white',cursor:'pointer',fontSize:13,fontWeight:600,display:'inline-flex',alignItems:'center',gap:6}),
+  btnOut: {padding:'9px 18px',borderRadius:8,border:'1px solid #374151',background:'transparent',color:'#d1d5db',cursor:'pointer',fontSize:13},
+  lbl: {color:'#d1d5db',fontSize:13,display:'block',marginBottom:4,fontWeight:500},
+  scColors: {pending:'#9ca3af',uploading:'#fbbf24',uploaded:'#60a5fa',building:'#fbbf24',success:'#34d399',failed:'#f87171',completed:'#34d399',in_progress:'#fbbf24',queued:'#9ca3af',cancelled:'#9ca3af'},
+  scLabels: {pending:'Pendente',uploading:'Enviando',uploaded:'Enviado',building:'Compilando',success:'Sucesso',failed:'Falhou',completed:'Concluído',in_progress:'Em progresso',queued:'Na fila',cancelled:'Cancelado'},
+};
+
+function ProgressBar({value}) {
+  return React.createElement('div',{style:{height:6,background:'#1f2937',borderRadius:4,overflow:'hidden'}},
+    React.createElement('div',{style:{height:'100%',background:'linear-gradient(90deg,#7c3aed,#a855f7)',width:value+'%',transition:'width 0.3s'}}));
+}
+function LogPanel({logs}) {
+  const ref = useRef(null);
+  useEffect(()=>{ if(ref.current) ref.current.scrollTop=ref.current.scrollHeight; },[logs]);
+  return React.createElement('div',{style:{...C.card,fontFamily:'monospace'}},
+    React.createElement('p',{style:{color:'#9ca3af',fontSize:12,margin:'0 0 8px'}},'Logs'),
+    React.createElement('div',{ref,style:{maxHeight:200,overflowY:'auto'}},
+      logs.map((l,i)=>React.createElement('div',{key:i,style:{fontSize:11,color:l.type==='success'?'#34d399':l.type==='error'?'#f87171':'#9ca3af',marginBottom:2}},
+        React.createElement('span',{style:{color:'#374151'}},(l.time||'')+' '),l.msg))));
+}
+
+// ── Layout ────────────────────────────────────────────────────────────────────
+const navItems = [['#/','Dashboard'],['#/upload','Enviar Projeto'],['#/history','Projetos'],['#/executions','Execuções'],['#/keys','Chaves'],['#/export','Enviar App p/ GitHub']];
+
+function Layout() {
+  const [open, setOpen] = useState(false);
+  const loc = useLocation();
+  const cur = '#' + loc.pathname;
+  return React.createElement('div',{style:{minHeight:'100vh',background:'#030712',display:'flex'}},
+    open&&React.createElement('div',{onClick:()=>setOpen(false),style:{position:'fixed',inset:0,background:'rgba(0,0,0,0.6)',zIndex:40}}),
+    React.createElement('aside',{style:{position:'fixed',top:0,bottom:0,left:open?0:'-260px',width:256,background:'#111827',borderRight:'1px solid #1f2937',transition:'left 0.2s',zIndex:50,display:'flex',flexDirection:'column'}},
+      React.createElement('div',{style:{padding:20,borderBottom:'1px solid #1f2937',display:'flex',alignItems:'center',gap:10}},
+        React.createElement('div',{style:{width:32,height:32,background:'linear-gradient(135deg,#7c3aed,#a855f7)',borderRadius:8,display:'flex',alignItems:'center',justifyContent:'center',color:'white',fontWeight:'bold',fontSize:14}},'G'),
+        React.createElement('div',null,
+          React.createElement('div',{style:{color:'white',fontWeight:700,fontSize:13}},'Germiani IA Studio'),
+          React.createElement('div',{style:{color:'#6b7280',fontSize:10}},'2.5 Flexh')),
+        React.createElement('button',{onClick:()=>setOpen(false),style:{marginLeft:'auto',color:'#9ca3af',background:'none',border:'none',cursor:'pointer',fontSize:20}},'×')),
+      React.createElement('nav',{style:{padding:12}},
+        navItems.map(([path,label])=>React.createElement('a',{key:path,href:path,onClick:()=>setOpen(false),style:{display:'block',padding:'10px 12px',borderRadius:12,color:cur===path?'#a78bfa':'#9ca3af',background:cur===path?'rgba(124,58,237,0.15)':'transparent',textDecoration:'none',fontSize:13,fontWeight:500,marginBottom:2}},label)))),
+    React.createElement('main',{style:{flex:1,minWidth:0}},
+      React.createElement('div',{style:{display:'flex',alignItems:'center',gap:12,padding:'12px 16px',borderBottom:'1px solid #1f2937',background:'rgba(17,24,39,0.8)',position:'sticky',top:0,zIndex:30}},
+        React.createElement('button',{onClick:()=>setOpen(true),style:{color:'#9ca3af',background:'none',border:'none',cursor:'pointer',fontSize:22}},'☰'),
+        React.createElement('span',{style:{color:'white',fontWeight:600,fontSize:14}},'Germiani IA Studio')),
+      React.createElement('div',{style:{padding:'24px 16px'}},React.createElement(Outlet))));
+}
+
+// ── Dashboard ─────────────────────────────────────────────────────────────────
+function Dashboard() {
+  const [projects,setProjects]=useState([]);
+  const [executions,setExecutions]=useState([]);
+  useEffect(()=>{ setProjects(db.projects.list('-created_date',5)); setExecutions(db.executions.list('-created_date',5)); },[]);
+  const s={total:projects.length,success:projects.filter(p=>p.status==='success').length,failed:projects.filter(p=>p.status==='failed').length,building:projects.filter(p=>['uploading','building'].includes(p.status)).length};
+  return React.createElement('div',{style:{display:'flex',flexDirection:'column',gap:24}},
+    React.createElement('div',null,
+      React.createElement('h1',{style:{color:'white',fontSize:22,fontWeight:700,margin:0}},'⚡ Germiani IA Studio 2.5 Flexh'),
+      React.createElement('p',{style:{color:'#9ca3af',fontSize:13,margin:'4px 0 0'}},'Gerencie projetos e compile para GitHub')),
+    React.createElement('div',{style:{display:'grid',gridTemplateColumns:'repeat(2,1fr)',gap:12}},
+      [['Total',s.total,'#a78bfa'],['Sucesso',s.success,'#34d399'],['Falhas',s.failed,'#f87171'],['Andamento',s.building,'#fbbf24']].map(([l,v,c])=>
+        React.createElement('div',{key:l,style:C.card},
+          React.createElement('p',{style:{color:c,fontSize:22,fontWeight:700,margin:0}},v),
+          React.createElement('p',{style:{color:'#6b7280',fontSize:12,margin:0}},l)))),
+    React.createElement('div',{style:{display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(140px,1fr))',gap:12}},
+      [['#/upload','📤 Enviar Projeto','linear-gradient(135deg,#7c3aed,#a855f7)'],['#/history','📂 Histórico','linear-gradient(135deg,#2563eb,#06b6d4)'],['#/keys','🔑 Chaves','linear-gradient(135deg,#d97706,#ea580c)']].map(([p,l,bg])=>
+        React.createElement('a',{key:p,href:p,style:{...C.card,textDecoration:'none',display:'block'}},
+          React.createElement('div',{style:{width:36,height:36,background:bg,borderRadius:8,marginBottom:8}}),
+          React.createElement('p',{style:{color:'white',fontWeight:600,fontSize:13,margin:0}},l)))),
+    React.createElement('div',null,
+      React.createElement('div',{style:{display:'flex',justifyContent:'space-between',marginBottom:12}},
+        React.createElement('h2',{style:{color:'white',fontSize:15,fontWeight:600,margin:0}},'Projetos Recentes'),
+        React.createElement('a',{href:'#/history',style:{color:'#a78bfa',fontSize:12}},'Ver todos')),
+      projects.length===0
+        ? React.createElement('div',{style:{...C.card,textAlign:'center',padding:40}},React.createElement('p',{style:{color:'#6b7280',fontSize:13}},'Nenhum projeto ainda'))
+        : projects.map(p=>React.createElement('div',{key:p.id,style:{...C.card,display:'flex',alignItems:'center',gap:12,marginBottom:8}},
+            React.createElement('div',{style:{flex:1,minWidth:0}},
+              React.createElement('p',{style:{color:'white',fontSize:13,fontWeight:500,margin:0,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}},p.name),
+              React.createElement('p',{style:{color:'#6b7280',fontSize:11,margin:0}},p.file_count||0,' arquivos')),
+            React.createElement('span',{style:{color:C.scColors[p.status]||'#9ca3af',fontSize:12}},C.scLabels[p.status]||p.status)))));
+}
+
+// ── Keys ──────────────────────────────────────────────────────────────────────
+function Keys() {
+  const df={github_token:'',github_username:'',default_repo:'',default_branch:'main',default_workflow:'build.yml'};
+  const [form,setForm]=useState(df);
+  const [saved,setSaved]=useState(false);
+  const [testing,setTesting]=useState(false);
+  const [result,setResult]=useState(null);
+  const [showTok,setShowTok]=useState(false);
+  useEffect(()=>{ const s=getSettings(); if(s) setForm({...df,...s}); },[]);
+  const save=()=>{ saveSettings(form); setSaved(true); setTimeout(()=>setSaved(false),2000); };
+  const test=async()=>{ setTesting(true); setResult(null); try{ const u=await ghApi.testConnection(form.github_token,form.github_username); setResult({ok:true,msg:'✓ Conectado como '+u.login}) }catch(e){ setResult({ok:false,msg:e.message}) } setTesting(false); };
+  const up=(f,v)=>setForm(p=>({...p,[f]:v}));
+  return React.createElement('div',{style:{maxWidth:480}},
+    React.createElement('h1',{style:{color:'white',fontSize:20,fontWeight:700,margin:'0 0 20px'}},'🔑 Chaves'),
+    React.createElement('div',{style:{...C.card,padding:20,display:'flex',flexDirection:'column',gap:14}},
+      React.createElement('div',null,
+        React.createElement('label',{style:C.lbl},'GitHub Token *'),
+        React.createElement('div',{style:{position:'relative'}},
+          React.createElement('input',{style:C.inp,type:showTok?'text':'password',value:form.github_token,onChange:e=>up('github_token',e.target.value),placeholder:'ghp_xxxxxxxxxxxx'}),
+          React.createElement('button',{onClick:()=>setShowTok(!showTok),style:{position:'absolute',right:10,top:'50%',transform:'translateY(-50%)',background:'none',border:'none',color:'#9ca3af',cursor:'pointer'}},showTok?'🙈':'👁'))),
+      React.createElement('div',null,React.createElement('label',{style:C.lbl},'Usuário do GitHub *'),React.createElement('input',{style:C.inp,value:form.github_username,onChange:e=>up('github_username',e.target.value),placeholder:'seu-usuario'})),
+      React.createElement('div',null,React.createElement('label',{style:C.lbl},'Repositório Padrão'),React.createElement('input',{style:C.inp,value:form.default_repo,onChange:e=>up('default_repo',e.target.value),placeholder:'meu-projeto'})),
+      React.createElement('div',null,React.createElement('label',{style:C.lbl},'Branch'),React.createElement('input',{style:C.inp,value:form.default_branch,onChange:e=>up('default_branch',e.target.value),placeholder:'main'})),
+      React.createElement('div',null,React.createElement('label',{style:C.lbl},'Workflow'),React.createElement('input',{style:C.inp,value:form.default_workflow,onChange:e=>up('default_workflow',e.target.value),placeholder:'build.yml'})),
+      result&&React.createElement('div',{style:{background:result.ok?'rgba(52,211,153,0.1)':'rgba(248,113,113,0.1)',border:'1px solid '+(result.ok?'#34d399':'#f87171'),borderRadius:8,padding:12,color:result.ok?'#34d399':'#f87171',fontSize:13}},result.msg),
+      React.createElement('div',{style:{display:'flex',gap:10,flexWrap:'wrap'}},
+        React.createElement('button',{onClick:test,disabled:!form.github_token||testing,style:C.btnOut},testing?'Testando...':'⚡ Testar'),
+        React.createElement('button',{onClick:save,style:C.btn()},saved?'✓ Salvo!':'💾 Salvar'))));
+}
+
+// ── Upload Project ────────────────────────────────────────────────────────────
+function UploadProject() {
+  const [settings,setSettings]=useState(null);
+  const [files,setFiles]=useState([]);
+  const [projectName,setProjectName]=useState('');
+  const [step,setStep]=useState('select');
+  const [progress,setProgress]=useState(0);
+  const [currentFile,setCurrentFile]=useState('');
+  const [logs,setLogs]=useState([]);
+  const [error,setError]=useState('');
+  const ref=useRef(null);
+  useEffect(()=>{ const s=getSettings(); if(s) setSettings(s); },[]);
+  const addLog=(msg,type='info')=>setLogs(p=>[...p,{msg,type,time:new Date().toLocaleTimeString('pt-BR')}]);
+  const onFolder=e=>{ const fl=Array.from(e.target.files); if(!fl.length) return; setFiles(fl); const fp=fl[0].webkitRelativePath||fl[0].name; if(!projectName) setProjectName(fp.split('/')[0]); };
+  const upload=async()=>{
+    if(!settings?.github_token){setError('Configure o GitHub Token primeiro'); return;}
+    if(!files.length){setError('Selecione uma pasta'); return;}
+    setStep('uploading'); setProgress(0); setLogs([]); setError('');
+    const {github_token:tk,github_username:owner,default_repo:repo,default_branch:branch='main',default_workflow:wf='build.yml'}=settings;
+    try{
+      addLog('Testando conexão...'); await ghApi.testConnection(tk,owner); addLog('✓ Conexão OK','success');
+      addLog('Verificando repo...'); await ghApi.ensureRepo(tk,owner,repo); addLog('✓ Repo pronto','success');
+      const proj=db.projects.create({name:projectName||'Projeto',status:'uploading',repo_owner:owner,repo_name:repo,branch,workflow_name:wf,file_count:files.length,total_size:files.reduce((a,f)=>a+f.size,0)});
+      addLog('Enviando '+files.length+' arquivos...');
+      for(let i=0;i<files.length;i++){
+        const f=files[i]; const rp=(f.webkitRelativePath||f.name).split('/').slice(1).join('/')||(f.webkitRelativePath||f.name);
+        setCurrentFile(rp); setProgress(Math.round((i/files.length)*90));
+        try{ const b64=await ghApi.fileToBase64(f); const sha=await ghApi.getFileSha(tk,owner,repo,branch,rp); await ghApi.putFile(tk,owner,repo,branch,rp,b64,sha); addLog('✓ '+rp,'success'); }
+        catch(e){ addLog('✗ '+rp+': '+e.message,'error'); }
+      }
+      setProgress(100); setStep('done'); addLog('✓ Finalizado!','success');
+      db.projects.update(proj.id,{status:'uploaded'});
+    }catch(e){ setError(e.message); addLog('Erro: '+e.message,'error'); setStep('select'); }
+  };
+  const reset=()=>{setStep('select');setFiles([]);setProjectName('');setProgress(0);setLogs([]);setError('');};
+  return React.createElement('div',{style:{maxWidth:640}},
+    React.createElement('h1',{style:{color:'white',fontSize:20,fontWeight:700,margin:'0 0 20px'}},'📤 Enviar Projeto'),
+    !settings?.github_token&&React.createElement('div',{style:{background:'rgba(251,191,36,0.1)',border:'1px solid rgba(251,191,36,0.3)',borderRadius:12,padding:16,color:'#fbbf24',fontSize:13,marginBottom:16}},'Configure as chaves primeiro. ',React.createElement('a',{href:'#/keys',style:{color:'#fbbf24',textDecoration:'underline'}},'Ir para Chaves')),
+    error&&React.createElement('div',{style:{background:'rgba(248,113,113,0.1)',border:'1px solid rgba(248,113,113,0.3)',borderRadius:12,padding:16,color:'#f87171',fontSize:13,marginBottom:16}},error),
+    step==='select'&&React.createElement('div',{style:{display:'flex',flexDirection:'column',gap:14}},
+      React.createElement('div',null,React.createElement('label',{style:C.lbl},'Nome do Projeto'),React.createElement('input',{style:C.inp,value:projectName,onChange:e=>setProjectName(e.target.value),placeholder:'Meu Projeto'})),
+      React.createElement('div',null,
+        React.createElement('label',{style:C.lbl},'Pasta do Projeto'),
+        React.createElement('input',{ref,type:'file',webkitdirectory:'',directory:'',multiple:true,onChange:onFolder,style:{display:'none'}}),
+        React.createElement('button',{onClick:()=>ref.current?.click(),style:{width:'100%',background:'#111827',border:'1px dashed #374151',borderRadius:12,padding:40,color:'#9ca3af',cursor:'pointer',fontSize:13}},'📁 Selecionar Pasta')),
+      files.length>0&&React.createElement('div',{style:C.card},
+        React.createElement('p',{style:{color:'white',fontSize:13,fontWeight:500,margin:'0 0 8px'}},files.length+' arquivos selecionados'),
+        React.createElement('div',{style:{maxHeight:100,overflowY:'auto'}},files.slice(0,20).map((f,i)=>React.createElement('div',{key:i,style:{color:'#9ca3af',fontSize:11,fontFamily:'monospace',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}},f.webkitRelativePath||f.name)))),
+      React.createElement('button',{onClick:upload,disabled:!files.length||!settings?.github_token,style:{...C.btn(),width:'100%',justifyContent:'center'}},'📤 Enviar para o GitHub')),
+    (step==='uploading'||step==='done')&&React.createElement('div',{style:{display:'flex',flexDirection:'column',gap:14}},
+      React.createElement('div',{style:C.card},
+        React.createElement('div',{style:{display:'flex',justifyContent:'space-between',marginBottom:8}},
+          React.createElement('span',{style:{color:'white',fontSize:13}},step==='done'?'✅ Concluído':'Enviando...'),
+          React.createElement('span',{style:{color:'#a78bfa',fontSize:13}},progress+'%')),
+        React.createElement(ProgressBar,{value:progress}),
+        currentFile&&step==='uploading'&&React.createElement('p',{style:{color:'#6b7280',fontSize:11,fontFamily:'monospace',margin:'6px 0 0'}},currentFile)),
+      React.createElement(LogPanel,{logs}),
+      step==='done'&&React.createElement('div',{style:{display:'flex',gap:10}},
+        React.createElement('button',{onClick:reset,style:{...C.btnOut,flex:1}},'Novo Envio'),
+        React.createElement('a',{href:'#/history',style:{...C.btn(),flex:1,textDecoration:'none',textAlign:'center',justifyContent:'center'}},'Ver Projetos'))));
+}
+
+// ── Project History ───────────────────────────────────────────────────────────
+function ProjectHistory() {
+  const [projects,setProjects]=useState([]);
+  const [exp,setExp]=useState(null);
+  useEffect(()=>{ setProjects(db.projects.list('-created_date',50)); },[]);
+  const del=(id)=>{ db.projects.delete(id); setProjects(p=>p.filter(x=>x.id!==id)); };
+  return React.createElement('div',null,
+    React.createElement('h1',{style:{color:'white',fontSize:20,fontWeight:700,margin:'0 0 20px'}},'📂 Projetos'),
+    projects.length===0
+      ? React.createElement('div',{style:{...C.card,textAlign:'center',padding:48}},React.createElement('p',{style:{color:'#6b7280'}},'Nenhum projeto'))
+      : projects.map(p=>React.createElement('div',{key:p.id,style:{...C.card,padding:0,overflow:'hidden',marginBottom:10}},
+          React.createElement('button',{onClick:()=>setExp(exp===p.id?null:p.id),style:{width:'100%',padding:'12px 16px',display:'flex',alignItems:'center',gap:12,background:'transparent',border:'none',cursor:'pointer',textAlign:'left'}},
+            React.createElement('div',{style:{flex:1,minWidth:0}},
+              React.createElement('p',{style:{color:'white',fontSize:13,fontWeight:500,margin:0,overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}},p.name),
+              React.createElement('p',{style:{color:'#6b7280',fontSize:11,margin:0}},new Date(p.created_date).toLocaleString('pt-BR')+' · '+(p.file_count||0)+' arquivos')),
+            React.createElement('span',{style:{color:C.scColors[p.status]||'#9ca3af',fontSize:12,background:'rgba(255,255,255,0.05)',borderRadius:20,padding:'3px 10px'}},C.scLabels[p.status]||p.status),
+            React.createElement('span',{style:{color:'#6b7280'}},exp===p.id?'▲':'▼')),
+          exp===p.id&&React.createElement('div',{style:{borderTop:'1px solid #1f2937',padding:16,display:'flex',gap:12,flexWrap:'wrap'}},
+            p.repo_owner&&React.createElement('a',{href:'https://github.com/'+p.repo_owner+'/'+p.repo_name,target:'_blank',style:{color:'#a78bfa',fontSize:12}},'🔗 GitHub'),
+            p.last_run_id&&React.createElement('a',{href:'https://github.com/'+p.repo_owner+'/'+p.repo_name+'/actions/runs/'+p.last_run_id,target:'_blank',style:{color:'#a78bfa',fontSize:12}},'⚙️ Actions'),
+            React.createElement('button',{onClick:()=>del(p.id),style:{color:'#f87171',background:'rgba(248,113,113,0.1)',border:'1px solid rgba(248,113,113,0.3)',borderRadius:6,padding:'4px 10px',cursor:'pointer',fontSize:12}},'🗑 Remover')))));
+}
+
+// ── Executions ────────────────────────────────────────────────────────────────
+function Executions() {
+  const [execs,setExecs]=useState([]);
+  useEffect(()=>{ setExecs(db.executions.list('-created_date',50)); },[]);
+  return React.createElement('div',null,
+    React.createElement('div',{style:{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:20}},
+      React.createElement('h1',{style:{color:'white',fontSize:20,fontWeight:700,margin:0}},'⚙️ Execuções'),
+      React.createElement('button',{onClick:()=>setExecs(db.executions.list('-created_date',50)),style:C.btnOut},'⟳ Atualizar')),
+    execs.length===0
+      ? React.createElement('div',{style:{...C.card,textAlign:'center',padding:48}},React.createElement('p',{style:{color:'#6b7280'}},'Nenhuma execução'))
+      : execs.map(e=>React.createElement('div',{key:e.id,style:{...C.card,marginBottom:10,display:'flex',alignItems:'center',gap:12}},
+          React.createElement('div',{style:{flex:1}},
+            React.createElement('p',{style:{color:'white',fontSize:13,fontWeight:500,margin:0}},e.project_name),
+            React.createElement('p',{style:{color:'#6b7280',fontSize:11,margin:0}},new Date(e.created_date).toLocaleString('pt-BR')+(e.run_id?' · Run #'+e.run_id:''))),
+          React.createElement('span',{style:{color:C.scColors[e.status]||'#9ca3af',fontSize:12,background:'rgba(255,255,255,0.05)',borderRadius:20,padding:'3px 10px'}},C.scLabels[e.status]||e.status))));
+}
+
+// ── Export (GitHub Pages) ─────────────────────────────────────────────────────
+function ExportPage() {
+  const [repoName,setRepoName]=useState('germiani-ia-studio');
+  const [step,setStep]=useState('config');
+  const [progress,setProgress]=useState(0);
+  const [logs,setLogs]=useState([]);
+  const [repoUrl,setRepoUrl]=useState('');
+  const [pagesUrl,setPagesUrl]=useState('');
+  const [error,setError]=useState('');
+  const [report,setReport]=useState(null);
+  const [userRepos,setUserRepos]=useState([]);
+  const [loadingRepos,setLoadingRepos]=useState(false);
+  const [showRepos,setShowRepos]=useState(false);
+  const [mode,setMode]=useState('pages');
+  const [localFiles,setLocalFiles]=useState([]);
+  const folderRef=useRef(null);
+  const settings=getSettings();
+  const hasToken=!!settings?.github_token;
+  const addLog=(msg,type='info')=>setLogs(p=>[...p,{msg,type,time:new Date().toLocaleTimeString('pt-BR')}]);
+
+  const loadRepos=async()=>{
+    if(!hasToken) return; setLoadingRepos(true);
+    try{ const r=await ghApi.listRepos(settings.github_token); setUserRepos(r); setShowRepos(true); }
+    catch(e){ setError(e.message); }
+    setLoadingRepos(false);
+  };
+
+  const handleSend=async()=>{
+    if(!hasToken){setError('Configure o GitHub Token nas Chaves'); return;}
+    if(!repoName.trim()){setError('Informe o repositório'); return;}
+    if(mode==='files'&&localFiles.length===0){setError('Selecione uma pasta'); return;}
+    setStep('sending'); setProgress(0); setLogs([]); setError(''); setReport(null);
+    const {github_token:token,github_username:owner}=settings; const branch='main';
+    try{
+      addLog('Testando conexão...'); await ghApi.testConnection(token,owner); addLog('✓ Conexão OK','success'); setProgress(10);
+      addLog('Verificando repositório...'); const repo=await ghApi.ensureRepo(token,owner,repoName); setRepoUrl(repo.html_url); addLog('✓ Repo: '+repo.html_url,'success'); setProgress(18);
+      let manifest={};
+      if(mode==='pages'){
+        manifest={
+          'index.html': document.documentElement.outerHTML,
+          '.nojekyll': '',
+          'README.md': '# Germiani IA Studio\n\nAcesse: https://'+owner+'.github.io/'+repoName
+        };
+      } else {
+        for(const f of localFiles){ const rel=f.webkitRelativePath||f.name; const path=rel.split('/').slice(1).join('/')||rel; manifest[path]=f; }
+      }
+      const paths=Object.keys(manifest); addLog('Enviando '+paths.length+' arquivos...');
+      let uploaded=0,failed=0,failedFiles=[];
+      for(let i=0;i<paths.length;i++){
+        const fp=paths[i]; const content=manifest[fp];
+        setProgress(18+Math.round((i/paths.length)*70));
+        try{
+          const b64=typeof content==='string'?toB64(content):await ghApi.fileToBase64(content);
+          const sha=await ghApi.getFileSha(token,owner,repoName,branch,fp);
+          await ghApi.putFile(token,owner,repoName,branch,fp,b64,sha);
+          addLog('✓ '+fp,'success'); uploaded++;
+        }catch(e){ addLog('✗ '+fp+': '+e.message,'error'); failed++; failedFiles.push(fp); }
+      }
+      setProgress(92);
+      if(mode==='pages'){ addLog('Ativando GitHub Pages...'); await ghApi.enablePages(token,owner,repoName); addLog('✓ Pages ativado','success'); }
+      setProgress(100);
+      const pu=mode==='pages'?'https://'+owner+'.github.io/'+repoName:null;
+      if(pu) setPagesUrl(pu);
+      setReport({total:paths.length,uploaded,failed,failedFiles,success:failed===0});
+      addLog(failed===0?'✅ Concluído!':'⚠ Concluído com erros',failed===0?'success':'error');
+      setStep('done');
+    }catch(e){ setError(e.message); addLog('Erro: '+e.message,'error'); setStep('config'); }
+  };
+
+  const reset=()=>{setStep('config');setReport(null);setLogs([]);setError('');setProgress(0);setLocalFiles([]);setPagesUrl('');};
+
+  return React.createElement('div',{style:{maxWidth:680,display:'flex',flexDirection:'column',gap:20}},
+    React.createElement('div',null,
+      React.createElement('h1',{style:{color:'white',fontSize:20,fontWeight:700,margin:0}},'🚀 Enviar App p/ GitHub'),
+      React.createElement('p',{style:{color:'#9ca3af',fontSize:13,margin:'4px 0 0'}},'Novo ou existente — GitHub Pages ou envio de arquivos')),
+    !hasToken&&React.createElement('div',{style:{background:'rgba(251,191,36,0.1)',border:'1px solid rgba(251,191,36,0.3)',borderRadius:12,padding:14,color:'#fbbf24',fontSize:13}},
+      '⚠ Configure o GitHub Token. ',React.createElement('a',{href:'#/keys',style:{color:'#fbbf24',textDecoration:'underline'}},'Ir para Chaves')),
+    error&&React.createElement('div',{style:{background:'rgba(248,113,113,0.1)',border:'1px solid rgba(248,113,113,0.3)',borderRadius:12,padding:14,color:'#f87171',fontSize:13}},error),
+    step==='config'&&React.createElement('div',{style:{display:'flex',flexDirection:'column',gap:14}},
+      React.createElement('div',{style:{display:'grid',gridTemplateColumns:'1fr 1fr',gap:10}},
+        [['pages','🌐 GitHub Pages','App completo via CDN'],['files','📁 Enviar Pasta','Arquivos locais p/ repo']].map(([m,t,s])=>
+          React.createElement('button',{key:m,onClick:()=>setMode(m),style:{padding:'14px 12px',borderRadius:12,border:'1px solid '+(mode===m?'rgba(124,58,237,0.5)':'#1f2937'),background:mode===m?'rgba(124,58,237,0.15)':'#111827',color:mode===m?'#c4b5fd':'#9ca3af',cursor:'pointer',textAlign:'left'}},
+            React.createElement('div',{style:{fontWeight:600,fontSize:13,marginBottom:4}},t),
+            React.createElement('div',{style:{fontSize:11,opacity:0.75}},s)))),
+      React.createElement('div',{style:{...C.card,padding:18,display:'flex',flexDirection:'column',gap:12}},
+        React.createElement('div',null,
+          React.createElement('label',{style:C.lbl},'Repositório (novo ou existente)'),
+          React.createElement('div',{style:{display:'flex',gap:8}},
+            React.createElement('input',{style:{...C.inp,flex:1},value:repoName,onChange:e=>setRepoName(e.target.value),placeholder:'nome-do-repo'}),
+            React.createElement('button',{onClick:loadRepos,disabled:!hasToken||loadingRepos,style:{...C.btnOut,flexShrink:0}},loadingRepos?'..':'📋 Meus Repos')),
+          settings?.github_username&&React.createElement('p',{style:{color:'#6b7280',fontSize:12,marginTop:4}},'github.com/'+settings.github_username+'/'+repoName)),
+        showRepos&&userRepos.length>0&&React.createElement('div',{style:{background:'#1f2937',borderRadius:8,maxHeight:180,overflowY:'auto'}},
+          React.createElement('div',{style:{display:'flex',justifyContent:'space-between',padding:'8px 12px',borderBottom:'1px solid #374151'}},
+            React.createElement('span',{style:{color:'#9ca3af',fontSize:12}},'Seus repos ('+userRepos.length+')'),
+            React.createElement('button',{onClick:()=>setShowRepos(false),style:{background:'none',border:'none',color:'#9ca3af',cursor:'pointer'}},'✕')),
+          userRepos.map(r=>React.createElement('button',{key:r.id,onClick:()=>{setRepoName(r.name);setShowRepos(false);},style:{width:'100%',textAlign:'left',padding:'9px 12px',background:'transparent',border:'none',color:'#e5e7eb',cursor:'pointer',fontSize:13,borderBottom:'1px solid #1f2937',display:'flex',justifyContent:'space-between'}},
+            r.name,React.createElement('span',{style:{color:'#6b7280',fontSize:11}},r.private?'🔒':'🌐')))),
+        mode==='files'&&React.createElement('div',null,
+          React.createElement('input',{ref:folderRef,type:'file',webkitdirectory:'',directory:'',multiple:true,onChange:e=>setLocalFiles(Array.from(e.target.files)),style:{display:'none'}}),
+          React.createElement('button',{onClick:()=>folderRef.current?.click(),style:{width:'100%',background:'#1f2937',border:'1px dashed #374151',borderRadius:8,padding:'20px',color:'#9ca3af',cursor:'pointer',fontSize:13}},localFiles.length>0?localFiles.length+' arquivos selecionados':'📁 Selecionar Pasta'))),
+      React.createElement('button',{onClick:handleSend,disabled:!hasToken||!repoName||(mode==='files'&&localFiles.length===0),style:{...C.btn(),width:'100%',justifyContent:'center',padding:'12px 20px',fontSize:14}},mode==='pages'?'🚀 Publicar no GitHub Pages':'📤 Enviar Arquivos')),
+    (step==='sending'||step==='done')&&React.createElement('div',{style:{display:'flex',flexDirection:'column',gap:14}},
+      React.createElement('div',{style:C.card},
+        React.createElement('div',{style:{display:'flex',justifyContent:'space-between',marginBottom:8}},
+          React.createElement('span',{style:{color:'white',fontSize:13}},step==='done'?(report?.success?'✅ Concluído!':'⚠ Com erros'):'Enviando...'),
+          React.createElement('span',{style:{color:'#a78bfa',fontSize:13}},progress+'%')),
+        React.createElement(ProgressBar,{value:progress})),
+      React.createElement(LogPanel,{logs}),
+      report&&React.createElement('div',{style:{...C.card,background:report.success?'rgba(52,211,153,0.08)':'rgba(251,191,36,0.08)',border:'1px solid '+(report.success?'rgba(52,211,153,0.3)':'rgba(251,191,36,0.3)')}},
+        React.createElement('div',{style:{display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:8,marginBottom:report.failedFiles.length?12:0}},
+          [['Total',report.total,'white'],['Enviados',report.uploaded,'#34d399'],['Falhas',report.failed,report.failed>0?'#f87171':'#6b7280']].map(([l,v,c])=>
+            React.createElement('div',{key:l,style:{background:'rgba(0,0,0,0.2)',borderRadius:8,padding:10,textAlign:'center'}},
+              React.createElement('p',{style:{color:c,fontSize:20,fontWeight:700,margin:0}},v),
+              React.createElement('p',{style:{color:'#9ca3af',fontSize:11,margin:0}},l))),
+        ),
+        report.failedFiles.length>0&&report.failedFiles.map(f=>React.createElement('p',{key:f,style:{color:'#fca5a5',fontSize:11,fontFamily:'monospace',margin:'2px 0'}},f))),
+      pagesUrl&&React.createElement('div',{style:{...C.card,background:'rgba(52,211,153,0.08)',border:'1px solid rgba(52,211,153,0.3)'}},
+        React.createElement('p',{style:{color:'#34d399',fontWeight:600,fontSize:14,margin:'0 0 8px'}},'🌐 App publicado em:'),
+        React.createElement('a',{href:pagesUrl,target:'_blank',style:{color:'#a78bfa',fontSize:13,fontFamily:'monospace',wordBreak:'break-all'}},pagesUrl),
+        React.createElement('p',{style:{color:'#6b7280',fontSize:12,marginTop:8,marginBottom:0}},'⏳ Pode levar 1–3 min no primeiro deploy.')),
+      step==='done'&&React.createElement('button',{onClick:reset,style:{...C.btnOut,width:'100%'}},'Novo Envio')));
+}
+
+// ── App ───────────────────────────────────────────────────────────────────────
+function App() {
+  return React.createElement(Router,null,
+    React.createElement(Routes,null,
+      React.createElement(Route,{element:React.createElement(Layout)},
+        React.createElement(Route,{path:'/',element:React.createElement(Dashboard)}),
+        React.createElement(Route,{path:'/upload',element:React.createElement(UploadProject)}),
+        React.createElement(Route,{path:'/history',element:React.createElement(ProjectHistory)}),
+        React.createElement(Route,{path:'/executions',element:React.createElement(Executions)}),
+        React.createElement(Route,{path:'/keys',element:React.createElement(Keys)}),
+        React.createElement(Route,{path:'/export',element:React.createElement(ExportPage)})),
+      React.createElement(Route,{path:'*',element:React.createElement('div',{style:{minHeight:'100vh',display:'flex',alignItems:'center',justifyContent:'center',color:'white'}},'Página não encontrada')})));
+}
+
+createRoot(document.getElementById('root')).render(React.createElement(App));
+</script>
+</body>
+</html>
